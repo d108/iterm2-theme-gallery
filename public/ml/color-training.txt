@@ -1,0 +1,26 @@
+# Format: FamilyName: semantic color name
+# HSL reference (same anchors for ML on/off):
+# Dark Neutral 0,0,0 | Dark Red 0,100,12 | Dark Orange/Brown 30,40,15 | Dark Yellow/Olive 60,40,15
+# Dark Green 120,50,15 | Dark Cyan 180,50,15 | Dark Blue 220,60,15 | Dark Purple 280,50,15
+# Light Neutral 0,0,85 | Light Red/Orange 25,80,85 | Light Cream 40,50,98 | Light Yellow 60,60,90
+# Light Blue 210,50,90 | Light Pink/Purple 330,70,90 | Light Green 120,40,90
+
+# Dark classes
+Dark Neutral: black
+Dark Red: dark red
+Dark Orange/Brown: dark brown
+Dark Yellow/Olive: dark olive
+Dark Green: dark green
+Dark Cyan: dark teal
+Dark Blue: dark blue
+Dark Purple: dark purple
+
+# 7 Light Classes
+Light Neutral: light gray
+Light Red/Orange: peach
+Light Cream: cream
+Light Yellow: pale yellow
+Light Blue: light blue
+Light Pink/Purple: light pink
+Light Green: light green
+

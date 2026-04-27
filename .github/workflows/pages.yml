@@ -1,0 +1,190 @@
+# Builds the Angular app and deploys static browser assets to GitHub Pages
+# (official Pages Actions flow — not the repo README).
+#
+# GitHub Pages source (Settings → Pages → Build and deployment):
+#   • "GitHub Actions" — uses the deploy-pages job below, OR
+#   • "Deploy from a branch" → Branch: gh-pages → Folder: / (root)
+#   Do NOT use branch "main" / (root): that serves the repo (README) instead of this app.
+#
+# Slack (optional): after a successful deploy, posts to your Incoming Webhook.
+#   1. https://api.slack.com/apps → Create New App → From scratch → enable Incoming Webhooks → add webhook → copy URL.
+#   2. Store secret name exactly: SLACK_WEBHOOK_URL
+#      - Repository secret: Settings → Secrets and variables → Actions → Repository secrets, OR
+#      - Environment secret: Settings → Environments → pick the environment (see below) → Environment secrets.
+#   Environment secrets are NOT visible to jobs unless the job declares `environment:` with the same name.
+#   This workflow uses environment name `github-pages` on the publish and notify jobs (GitHub’s usual name for Pages).
+#   If your environment is named differently (e.g. `production`), change `environment:` under those jobs to match.
+#
+# ntfy (optional): NTFY_DEPLOY_TOPIC as repository or environment secret (same environment as Slack if you use both).
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        env:
+          # Some runners skip LFS smudge by default; pointers then ship to Pages as "PNG".
+          GIT_LFS_SKIP_SMUDGE: '0'
+        with:
+          lfs: true
+          fetch-depth: 0
+
+      # checkout's lfs: true is not always enough; fetch + checkout forces real blobs into the tree.
+      - name: Materialize Git LFS files
+        env:
+          GIT_LFS_SKIP_SMUDGE: '0'
+        run: |
+          set -euo pipefail
+          git lfs version
+          git lfs install --force
+          git lfs fetch origin "${{ github.sha }}"
+          git lfs checkout
+          python3 <<'PY'
+          import pathlib
+          root = pathlib.Path("public/screenshots")
+          paths = sorted(root.glob("*.png"))
+          if not paths:
+              raise SystemExit("No PNG files under public/screenshots")
+          for p in paths[:40]:
+              sig = p.read_bytes()[:8]
+              if sig[:4] != b"\x89PNG":
+                  raise SystemExit(f"Not a real PNG (missing signature): {p} starts with {sig!r}")
+          print(f"PNG signature OK on {min(len(paths), 40)} sample file(s), {len(paths)} total")
+          PY
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Angular app
+        run: npm run build -- --base-href /iterm2-theme-gallery/
+
+      - name: Stage site files
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp -r dist/iterm-gallery/browser/* _site/
+          if [ -f _site/404/index.html ]; then
+            cp _site/404/index.html _site/404.html
+          fi
+          touch _site/.nojekyll
+          ls -la _site
+
+      - name: Verify staged screenshots are real PNGs
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import pathlib
+          root = pathlib.Path("_site/screenshots")
+          paths = sorted(root.glob("*.png"))
+          if not paths:
+              raise SystemExit("No PNG under _site/screenshots")
+          for p in paths[:40]:
+              sig = p.read_bytes()[:8]
+              if sig[:4] != b"\x89PNG":
+                  raise SystemExit(f"_site screenshot is not binary PNG: {p} {sig!r}")
+          print(f"_site PNG OK: {len(paths)} file(s)")
+          PY
+
+      - name: Verify repository link in published index.html
+        run: |
+          set -euo pipefail
+          if ! grep -q 'https://github.com/d108/iterm2-theme-gallery' _site/index.html; then
+            echo "::error::_site/index.html must contain the GitHub repository URL (see src/index.html)."
+            exit 1
+          fi
+
+      - name: Block disallowed attribution in published files
+        run: |
+          set -euo pipefail
+          if grep -RIn --include='*.html' --include='*.js' -E -i \
+            'made[-[:space:]]+with[-[:space:]:]*cursor|built[-[:space:]]+with[-[:space:]:]*cursor' _site; then
+            echo "::error::Published HTML/JS must not contain disallowed tooling attribution."
+            exit 1
+          fi
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      # Keeps branch gh-pages in sync so Pages still works if the repo is set to
+      # "Deploy from a branch → gh-pages" instead of "GitHub Actions".
+      - name: Push static site to gh-pages branch
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: _site
+          branch: gh-pages
+          clean: true
+          commit-message: "Deploy iTerm2 theme gallery"
+          git-config-name: github-actions[bot]
+          git-config-email: 41898282+github-actions[bot]@users.noreply.github.com
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+  notify:
+    needs: publish
+    if: ${{ needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: github-pages
+    steps:
+      - name: Optional ntfy notification
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_DEPLOY_TOPIC }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NTFY_TOPIC:-}" ]; then
+            echo "Skip ntfy (NTFY_DEPLOY_TOPIC not set for this environment)."
+            exit 0
+          fi
+          MSG="${GITHUB_REPOSITORY}: GitHub Pages deployed (${GITHUB_SHA:0:7}). ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl -fsS -H "Title: Pages deployed" -d "$MSG" "$NTFY_TOPIC" || echo "::warning::ntfy request failed (check NTFY_DEPLOY_TOPIC)"
+
+      - name: Notify Slack (Pages deployed)
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "Skip Slack (SLACK_WEBHOOK_URL not set for this environment)."
+            exit 0
+          fi
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          MSG="*GitHub Pages deployed* — \`${GITHUB_REPOSITORY}\` @ \`${GITHUB_SHA:0:7}\` — <${RUN_URL}|Open workflow run>"
+          payload=$(jq -n --arg text "$MSG" '{text: $text}')
+          curl -fsS -X POST -H 'Content-Type: application/json' -d "$payload" "$SLACK_WEBHOOK_URL" || echo "::warning::Slack webhook request failed"
