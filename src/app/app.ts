@@ -1,12 +1,13 @@
 import { ApplicationRef, Component, computed, inject, OnInit, signal, HostListener } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { CommonModule } from '@angular/common';
-import { MLService, ML_TRAINING_EPOCHS } from './ml/ml.service';
+import { MLService, ML_TRAINING_EPOCHS, type MlTrainingRunStats } from './ml/ml.service';
 import {
-  cssVarRef,
   PALETTE_FAMILY_ORDER,
+  isPaletteFamilyDark,
   paletteOrderIndex,
   semanticVarForFamily,
+  swatchHslForFamily,
 } from '../theme-family-tokens';
 
 interface ThemePalette {
@@ -32,10 +33,18 @@ interface Theme {
 
 interface Family {
   id: string;
+  /** Index in `filteredThemes()`; -1 if no theme maps to this family (navigator button disabled). */
   startIndex: number;
   label: string;
   isDark: boolean;
   semanticVar: string;
+}
+
+interface MlTrainingDiagnostics {
+  stats: MlTrainingRunStats;
+  histogram: Record<string, number>;
+  emptyFamilies: string[];
+  unknownPredictions: number;
 }
 
 interface FamilyJson {
@@ -68,11 +77,13 @@ interface DataResponse {
       </p>
       <div class="nav-bar">
         <div class="color-navigator desktop-palette">
-          @for (fam of activeFamilies(); track fam.id) {
+            @for (fam of activeFamilies(); track fam.id) {
             <button 
+              type="button"
               class="family-btn" 
-              [style.background-color]="cssVarRefFn(fam.semanticVar)" 
-              [title]="'Jump to ' + fam.label"
+              [style.background-color]="anchorSwatchStyle(fam.label)" 
+              [disabled]="fam.startIndex < 0"
+              [title]="fam.startIndex < 0 ? ('No themes in “' + fam.label + '” (current filter)') : ('Jump to ' + fam.label)"
               (click)="scrollToIndex(fam.startIndex)">
             </button>
           }
@@ -81,9 +92,11 @@ interface DataResponse {
           <div class="palette-row">
             @for (fam of darkFamilies(); track fam.id) {
               <button 
+                type="button"
                 class="family-btn" 
-                [style.background-color]="cssVarRefFn(fam.semanticVar)" 
-                [title]="'Jump to ' + fam.label"
+                [style.background-color]="anchorSwatchStyle(fam.label)" 
+                [disabled]="fam.startIndex < 0"
+                [title]="fam.startIndex < 0 ? ('No themes in “' + fam.label + '” (current filter)') : ('Jump to ' + fam.label)"
                 (click)="scrollToIndex(fam.startIndex)">
               </button>
             }
@@ -91,9 +104,11 @@ interface DataResponse {
           <div class="palette-row">
             @for (fam of lightFamilies(); track fam.id) {
               <button 
+                type="button"
                 class="family-btn" 
-                [style.background-color]="cssVarRefFn(fam.semanticVar)" 
-                [title]="'Jump to ' + fam.label"
+                [style.background-color]="anchorSwatchStyle(fam.label)" 
+                [disabled]="fam.startIndex < 0"
+                [title]="fam.startIndex < 0 ? ('No themes in “' + fam.label + '” (current filter)') : ('Jump to ' + fam.label)"
                 (click)="scrollToIndex(fam.startIndex)">
               </button>
             }
@@ -126,10 +141,17 @@ interface DataResponse {
           </button>
         </div>
 
-        @if (useML()) {
-          <div class="control-group">
-            <span class="group-label">ML:</span>
-            <button (click)="onToggleML()" [class.active]="true" title="Turn ML mode off">
+        <div class="control-group ml-desktop-only">
+          <span class="group-label">ML:</span>
+          @if (!useML()) {
+            <button
+              type="button"
+              (click)="useML.set(true)"
+              title="Enable experimental color-family model, training UI, and navigator">
+              Enable ML
+            </button>
+          } @else {
+            <button type="button" (click)="onToggleML()" class="active" title="Turn ML mode off">
               ML Active
             </button>
 
@@ -140,7 +162,7 @@ interface DataResponse {
                   <span class="ml-epoch-text">Training {{ trainingEpochLabel() }}</span>
                 </div>
               } @else {
-                <button (click)="relearn()" class="active">Train Model</button>
+                <button type="button" (click)="relearn()" class="active">Train Model</button>
               }
             } @else {
               @if (isTraining()) {
@@ -149,12 +171,12 @@ interface DataResponse {
                   <span class="ml-epoch-text">Training {{ trainingEpochLabel() }}</span>
                 </div>
               } @else {
-                <button (click)="relearn()">Relearn</button>
-                <button (click)="clearCustomTraining()" title="Clear browser training data">Reset</button>
+                <button type="button" (click)="relearn()">Relearn</button>
+                <button type="button" (click)="clearCustomTraining()" title="Clear browser training data">Reset</button>
               }
             }
-          </div>
-        }
+          }
+        </div>
 
         @if (showDebugControl()) {
           <div class="control-group">
@@ -239,6 +261,67 @@ interface DataResponse {
       </div>
     } @else if (viewMode() === 'training') {
       <div class="index-list">
+        @if (mlTrainingDiagnostics(); as diag) {
+          <section class="ml-training-report" aria-label="Last training run report">
+            <h2>Last training run</h2>
+            <p class="ml-report-summary">
+              Finished <time [attr.datetime]="diag.stats.finishedAt">{{ diag.stats.finishedAt }}</time>
+              · {{ diag.stats.durationMs | number }} ms
+              · <strong>{{ diag.stats.classCount }}</strong> model classes (NN outputs)
+              · <strong>{{ diag.stats.totalTrainingRows | number }}</strong> synthetic rows
+              · <strong>{{ diag.stats.totalGradientSteps | number }}</strong> gradient steps
+              · <strong>{{ diag.stats.customAnchorCount }}</strong> custom anchors
+            </p>
+            @if (diag.stats.familiesWithCustomAnchors.length > 0) {
+              <p class="ml-report-pull">Per-theme custom overrides present for:
+                <strong>{{ diag.stats.familiesWithCustomAnchors.join(', ') }}</strong>
+              </p>
+            }
+            @if (diag.emptyFamilies.length > 0) {
+              <p class="ml-report-warning" role="status">
+                <strong>No themes</strong> predicted into {{ diag.emptyFamilies.length }} palette famil{{ diag.emptyFamilies.length === 1 ? 'y' : 'ies' }} (filter “All”):
+                {{ diag.emptyFamilies.join(', ') }}
+              </p>
+            }
+            @if (diag.unknownPredictions > 0) {
+              <p class="ml-report-warning">{{ diag.unknownPredictions }} theme(s) still “Unknown” (rule fallback).</p>
+            }
+            @if (diag.stats.classCount !== 15) {
+              <p class="ml-report-warning" role="status">
+                The model has <strong>{{ diag.stats.classCount }}</strong> output classes; the default palette has 15.
+                A different count usually means custom anchors use an extra or mistyped family name.
+              </p>
+            }
+            <h3 class="ml-report-table-title">Per-family training mass &amp; gallery predictions</h3>
+            <table class="ml-report-table">
+              <thead>
+                <tr>
+                  <th>Family</th>
+                  <th>Synthetic rows</th>
+                  <th>Gradient steps</th>
+                  <th>Themes predicted</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (row of mlReportTableRows(); track row.name) {
+                  <tr [class.ml-report-zero-themes]="row.themeCount === 0">
+                    <td><strong>{{ row.name }}</strong></td>
+                    <td>{{ row.trainRows | number }}</td>
+                    <td>{{ row.gradSteps | number }}</td>
+                    <td>{{ row.themeCount | number }}</td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+            <details class="ml-report-raw">
+              <summary>NN class order (console)</summary>
+              <p class="ml-report-hint">Exact output layer order is logged as <code>report.classOrder</code> in the browser devtools console after training.</p>
+              <pre class="ml-report-pre">{{ diag.stats.classOrder.join(', ') }}</pre>
+            </details>
+          </section>
+        } @else {
+          <p class="ml-report-placeholder">Train the model to see timing, synthetic counts, and how many themes land in each family.</p>
+        }
         <h2>Base Training Set (from color-training.txt)</h2>
         <table>
           <thead>
@@ -458,7 +541,42 @@ interface DataResponse {
     .phone-palette { display: none; flex-direction: column; }
     .palette-row { display: flex; gap: 4px; padding: 2px; justify-content: center; }
     .family-btn { width: 24px; height: 24px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.1); cursor: pointer; transition: transform 0.1s; }
-    .family-btn:hover { transform: scale(1.2); border-color: #fff; }
+    .family-btn:hover:not(:disabled) { transform: scale(1.2); border-color: #fff; }
+    /* Empty slot: keep swatch fill identical ML on/off (no opacity wash-out). */
+    .family-btn:disabled {
+      opacity: 1;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.42);
+    }
+    .ml-training-report {
+      margin-bottom: 1.75rem;
+      padding: 1rem 1.25rem;
+      background: rgba(0,0,0,0.2);
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .ml-training-report h2 { margin: 0 0 0.5rem; font-size: 1.1rem; }
+    .ml-training-report h3 { margin: 1rem 0 0.5rem; font-size: 0.95rem; }
+    .ml-report-summary, .ml-report-pull, .ml-report-placeholder { color: #aaa; font-size: 0.85rem; line-height: 1.45; margin: 0.35rem 0; }
+    .ml-report-warning { color: #e8c170; font-size: 0.85rem; margin: 0.5rem 0; }
+    .ml-report-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin-top: 0.5rem; }
+    .ml-report-table th, .ml-report-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+    .ml-report-table th { color: #999; font-weight: 600; }
+    .ml-report-zero-themes td { color: #777; }
+    .ml-report-raw { margin-top: 0.75rem; font-size: 0.8rem; }
+    .ml-report-hint { color: #888; margin: 0.35rem 0; }
+    .ml-report-pre {
+      margin: 0.5rem 0 0;
+      padding: 0.5rem;
+      background: rgba(0,0,0,0.35);
+      border-radius: 4px;
+      overflow-x: auto;
+      font-size: 0.72rem;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .ml-report-placeholder { padding: 0.5rem 0 1rem; }
 
     .plist-help {
       transition: all 0.3s ease-in-out;
@@ -485,6 +603,10 @@ interface DataResponse {
       .plist-help { margin: 0 auto 0.5rem !important; }
     }
 
+    @media (max-width: 768px) {
+      .ml-desktop-only { display: none !important; }
+    }
+
     @media (max-width: 950px) and (orientation: landscape) {
       header { padding: 0.4rem 1rem !important; margin-bottom: 0.5rem !important; }
       header h1 { font-size: 1rem !important; margin: 0 0 0.4rem 0 !important; }
@@ -500,6 +622,8 @@ interface DataResponse {
 
     .controls-row { display: flex; justify-content: center; flex-wrap: wrap; gap: 1rem; align-items: center; }
     .control-group { display: flex; align-items: center; gap: 0.4rem; background: #222; padding: 0.3rem 0.6rem; border-radius: 8px; border: 1px solid #333; }
+    /* Desktop-only ML strip: width only (do not use pointer:coarse — touch laptops need this too). */
+    .ml-desktop-only { display: flex; }
     .group-label { font-size: 0.7rem; text-transform: uppercase; color: #666; margin-right: 0.3rem; }
 
     .ml-status-badge {
@@ -550,13 +674,16 @@ interface DataResponse {
 
     .training-custom-header {
       margin-top: 3rem;
+      padding-bottom: 1.5rem;
       display: flex;
       flex-wrap: wrap;
       align-items: center;
-      gap: 1rem;
-      h2 { margin: 0; flex: 1; min-width: 12rem; }
+      width: 100%;
+      row-gap: 0.65rem;
+      h2 { margin: 0; flex: 1 1 auto; min-width: 0; }
       .btn-remove-all-custom {
         flex-shrink: 0;
+        margin-inline-start: auto;
         border: 1px solid #666 !important;
         color: #e0e0e0 !important;
         background: #2a2a2a !important;
@@ -734,8 +861,6 @@ export class App implements OnInit {
   private http = inject(HttpClient);
   private mlService = inject(MLService);
   private appRef = inject(ApplicationRef);
-  /** Expose for template: `var(--theme-*)` from token name. */
-  protected readonly cssVarRefFn = cssVarRef;
   protected readonly themes = signal<Theme[]>([]);
   protected readonly families = signal<Family[]>([]);
   protected readonly viewMode = signal<'data' | 'screenshot' | 'index' | 'training'>('data');
@@ -745,6 +870,18 @@ export class App implements OnInit {
   protected readonly useML = signal(false);
   protected readonly mlReady = signal(false);
   protected readonly isTraining = signal(false);
+  /** Populated after each successful Train / Relearn (Training Set view). */
+  protected readonly mlTrainingDiagnostics = signal<MlTrainingDiagnostics | null>(null);
+  protected readonly mlReportTableRows = computed(() => {
+    const diag = this.mlTrainingDiagnostics();
+    if (!diag) return [];
+    return PALETTE_FAMILY_ORDER.map(name => ({
+      name,
+      trainRows: diag.stats.trainingRowsByFamily[name] ?? 0,
+      gradSteps: diag.stats.gradientStepsByFamily[name] ?? 0,
+      themeCount: diag.histogram[name] ?? 0,
+    }));
+  });
   
   protected readonly selectedThemes = signal<Set<string>>(new Set());
   protected readonly reportContent = signal<string | null>(null);
@@ -932,8 +1069,9 @@ export class App implements OnInit {
       for (const name of PALETTE_FAMILY_ORDER) {
         const meta = mlMeta.find(m => m.name === name);
         if (!meta) continue;
-        if (mode === 'dark' && !meta.isDark) continue;
-        if (mode === 'light' && meta.isDark) continue;
+        const paletteDark = isPaletteFamilyDark(name);
+        if (mode === 'dark' && !paletteDark) continue;
+        if (mode === 'light' && paletteDark) continue;
 
         let index: number;
         if (this.useML()) {
@@ -944,15 +1082,14 @@ export class App implements OnInit {
           index = themes.findIndex(t => t.family.toLowerCase() === meta.name.toLowerCase());
         }
 
-        if (index !== -1) {
-          results.push({
-            id: meta.name,
-            label: meta.name,
-            semanticVar: meta.semanticVar,
-            startIndex: index,
-            isDark: meta.isDark
-          });
-        }
+        // Always show all palette slots (15 for base ML); disable jump when no theme maps here.
+        results.push({
+          id: meta.name,
+          label: meta.name,
+          semanticVar: meta.semanticVar,
+          startIndex: index,
+          isDark: paletteDark,
+        });
       }
       return results;
     }
@@ -1063,8 +1200,11 @@ export class App implements OnInit {
           this.trainingEpochUi.set(epoch);
           this.appRef.tick();
         })
-        .then(() => {
+        .then(stats => {
           this.mlReady.set(true);
+          if (stats) {
+            this.mlTrainingDiagnostics.set(this.buildMlDiagnostics(stats));
+          }
         })
         .finally(() => {
           this.isTraining.set(false);
@@ -1084,7 +1224,12 @@ export class App implements OnInit {
     if (newFamily === 'none') {
       this.mlService.removeCustomAnchor(theme.name);
     } else {
-      this.mlService.addCustomAnchor(theme.name, newFamily, [theme.hue, theme.sat, theme.light]);
+      this.mlService.addCustomAnchor(
+        theme.name,
+        newFamily,
+        [theme.hue, theme.sat, theme.light],
+        theme.colors.bg
+      );
     }
   }
 
@@ -1116,8 +1261,8 @@ export class App implements OnInit {
   }
 
   /**
-   * When ML is on, ordering and accents use nearest family in Oklab (ΔE) from `theme.colors.bg`
-   * (fallback HSL), not the trained NN — see `MLService.classifyThemeColor`. Unknown only before anchors load.
+   * When ML is on, ordering uses the trained NN on Oklab features (after Train / restore); until then
+   * falls back to rule-based Oklab + hue. Custom per-theme anchors still win.
    */
   private sortFamilyForTheme(theme: Theme): string {
     if (!this.useML()) return theme.family;
@@ -1128,6 +1273,16 @@ export class App implements OnInit {
   getMLFamily(theme: Theme): string {
     const custom = this.mlService.getCustomAnchorFamily(theme.name);
     if (custom) return custom;
+    if (this.useML() && this.mlReady()) {
+      const fromNn = this.mlService.predictNeuralFamily(
+        theme.colors.bg,
+        theme.hue,
+        theme.sat,
+        theme.light,
+        theme.isDark
+      );
+      if (fromNn) return fromNn;
+    }
     return this.mlService.classifyThemeColor(
       theme.colors.bg,
       theme.hue,
@@ -1137,17 +1292,30 @@ export class App implements OnInit {
     );
   }
 
-  /** Same family as sort / navigator (Oklab + custom overrides); keeps the ML line aligned with placement. */
+  /** Same family as sort / navigator (NN when trained, else rules + custom overrides). */
   getPrediction(theme: Theme): string {
     return this.getMLFamily(theme);
+  }
+
+  private buildMlDiagnostics(stats: MlTrainingRunStats): MlTrainingDiagnostics {
+    const histogram: Record<string, number> = {};
+    let unknownPredictions = 0;
+    for (const t of this.themes()) {
+      const f = this.getMLFamily(t);
+      if (f === 'Unknown') unknownPredictions++;
+      histogram[f] = (histogram[f] ?? 0) + 1;
+    }
+    const emptyFamilies = PALETTE_FAMILY_ORDER.filter(n => (histogram[n] ?? 0) === 0);
+    return { stats, histogram, emptyFamilies, unknownPredictions };
   }
 
   getAnchors() {
     return this.mlService.getAnchors();
   }
 
+  /** Named palette swatch — canonical HSL from `theme-palette.scss`, not theme bg / ML anchors. */
   anchorSwatchStyle(family: string): string {
-    return cssVarRef(semanticVarForFamily(family));
+    return swatchHslForFamily(family);
   }
 
   removeAnchor(anchor: any) {
@@ -1158,6 +1326,7 @@ export class App implements OnInit {
 
   scrollToIndex(index: number) {
     if (this.isTraining()) return;
+    if (index < 0) return;
     const themes = this.filteredThemes();
     const targetTheme = themes[index];
     if (targetTheme) {
@@ -1212,14 +1381,8 @@ export class App implements OnInit {
     return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
   }
 
+  /** Top strip on cards: same predefined palette colors as the navigator, not the theme’s own bg. */
   getThemeFamilyColor(theme: Theme): string {
-    const familyName = this.sortFamilyForTheme(theme);
-    const meta = this.mlService.getFamilyMetadata().find(
-      m => m.name.toLowerCase() === familyName.toLowerCase()
-    );
-    if (meta) return cssVarRef(meta.semanticVar);
-    const fam = this.families().find(f => f.label === familyName);
-    if (fam) return cssVarRef(fam.semanticVar);
-    return cssVarRef('--theme-light-neutral');
+    return swatchHslForFamily(this.sortFamilyForTheme(theme));
   }
 }

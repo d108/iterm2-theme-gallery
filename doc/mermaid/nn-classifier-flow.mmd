@@ -1,0 +1,31 @@
+%% Regenerate SVG: npm run render:diagram
+%% Short labels avoid foreignObject in many Mermaid builds (better SVG preview)
+%%{init: {'theme': 'neutral', 'flowchart': {'htmlLabels': false, 'curve': 'linear', 'padding': 10}}}%%
+flowchart TB
+  BG[Background hex]
+  OK[Oklab lightness tint]
+  SC[Scale inputs]
+  NN[Mini net 3 to 12 to N scores]
+  BS[Best score wins]
+  SAN[Rule checks gray dark light pins]
+  OUT[Gallery family label]
+  MAN[Manual dropdown wins]
+
+  BG --> OK --> SC --> NN --> BS --> SAN --> OUT
+  MAN -. skip NN plus rules .-> OUT
+
+  subgraph TR[Training when Train clicked]
+    direction TB
+    T1[Swatches file plus customs]
+    T2[Nudge colors; clip invalid]
+    T3[Split dark light bands]
+    T4[Save weights localStorage]
+    T1 --> T2 --> T3 --> T4
+  end
+
+  NN -. teaches .-> T1
+  T4 -. weights reload .-> NN
+
+  classDef badge fill:#eaeaea,color:#111111,stroke:#bfbfbf,stroke-width:1px;
+  class SAN badge;
+  class OUT badge;

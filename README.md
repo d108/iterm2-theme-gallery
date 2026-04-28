@@ -37,12 +37,14 @@ This project is intended to reduce the UI friction around browsing, sorting, sel
 
 ## Color Classification
 
-The gallery uses deterministic color rules rather than neural-network inference:
+**Default (no ML):** deterministic Oklab + hue rules:
 
-1. A direct custom override for that exact theme.
+1. A direct custom override for that exact theme (ML mode).
 2. Oklab nearest-anchor matching for high-chroma colors.
 3. Hue buckets for low-chroma colors.
 4. Neutral, light, and dark consistency rules.
+
+**ML mode (`?ml=1`):** after you train once, a **tiny in-browser network** scores each theme background (in **Oklab**, same perceptual space as the rules). The app still applies **sanity checks** so obvious mistakes are corrected. **Train / Relearn** also folds in any **per-theme family picks** you saved: synthetic training colors are generated around those themes’ real backgrounds, so the model shifts toward your anchors as well as the defaults in `color-training.txt`. Non-technical overview + picture: **[doc/nn-classifier.md](doc/nn-classifier.md)** ([diagram SVG](doc/assets/nn-classifier-flow.svg)).
 
 ## Features
 
@@ -55,11 +57,12 @@ The gallery uses deterministic color rules rather than neural-network inference:
     - Guided installation with `make patch`
 - iTerm2 requires a restart to see newly imported color schemes.
 
-## Neural Network
+## Neural Network (optional experiment)
 
-- An attempt was made to use a neural network to classify the background colors into a fixed classification scheme, but Oklab-based color rules turned out to match the desired behavior better.
-- There is a training UI that can save custom anchors and retrain a small demo model using synthetic HSL samples around those anchors, if you want to experiment with the neural network approach.
-- Otherwise, gallery sorting, badges, and generated JSON use a deterministic Oklab and hue classifier, not neural-network predictions.
+This is **not** cloud AI or ChatGPT—it is **a small learner** stored in your browser that remembers example colors, then guesses which palette family suits a backdrop. **Safety rules tidy the guess afterward** so nonsense labels bounce off—for example saturated blues remain bold colors, not pastel gray. Whenever you rerun **Train / Relearn**, your manual theme→family picks train alongside cookbook swatches in `color-training.txt`.
+
+- **Plain-English walkthrough + diagram:** [doc/nn-classifier.md](doc/nn-classifier.md) · [flowchart](doc/assets/nn-classifier-flow.svg).
+- If you never open `?ml=1` or you skip **Train**, behavior is **100% rule-based** (section above).
 
 ### Neural network (ML) UI
 
@@ -72,7 +75,7 @@ npm start
 
 The query parameter is removed from the address bar after load, but ML stays active. You should see **ML Active**, **Train Model** / **Relearn**, and a **Training Set** view next to Rendered / Screenshot / Index. Use **ML Active** to turn the experiment off again.
 
-On the [live GitHub Pages site](https://d108.github.io/iterm2-theme-gallery/), append the same query (for example []`…/iterm2-theme-gallery/?ml=1`).
+On the [live GitHub Pages site](https://d108.github.io/iterm2-theme-gallery/), append the same parameter (for example add `?ml=1` to the page URL).
 
 ## Installation
 

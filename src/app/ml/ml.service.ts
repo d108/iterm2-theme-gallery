@@ -4,17 +4,40 @@ import { NeuralNetwork, type NeuralNetworkState } from './nn';
 import { BehaviorSubject, firstValueFrom } from 'rxjs';
 import { paletteOrderIndex, semanticVarForFamily } from '../../theme-family-tokens';
 import {
+  clampOklabToSrgbGamut,
   hexToOklab,
   hslToOklab,
+  linearSrgb01ToHsl,
   oklabChroma,
   oklabDeltaE,
+  oklabToLinearSrgb01,
   rgbChannelSpreadFromHex,
   rgbChannelSpreadFromHsl,
   type Oklab,
 } from './oklab';
 
-/** Gradient-descent passes over the full synthetic set (matches training loop). */
-export const ML_TRAINING_EPOCHS = 1500;
+/**
+ * Full passes over the synthetic set. 600 is enough for this 3→12→N net; 1500 was overkill and
+ * over-fit custom clouds when users add a few anchors.
+ */
+export const ML_TRAINING_EPOCHS = 600;
+
+/** Emitted when `loadAndTrain()` finishes; use with gallery histogram for a full picture. */
+export interface MlTrainingRunStats {
+  finishedAt: string;
+  durationMs: number;
+  epochs: number;
+  classCount: number;
+  /** NN output column order (matches `targets` indices). */
+  classOrder: readonly string[];
+  trainingRowsByFamily: Record<string, number>;
+  gradientStepsByFamily: Record<string, number>;
+  totalTrainingRows: number;
+  totalGradientSteps: number;
+  customAnchorCount: number;
+  /** Distinct family labels that have at least one per-theme custom anchor. */
+  familiesWithCustomAnchors: readonly string[];
+}
 
 /**
  * Badge + console + macrotask yield only every N epochs. All ML_TRAINING_EPOCHS still run;
@@ -74,10 +97,26 @@ const ANCHOR_HUE_BY_FAMILY: Readonly<Record<string, number>> = {
 /** If Oklab’s winner differs this much from `theme.hue`, trust circular hue buckets instead (55 was loose: Ocean ~222° stayed Dark Cyan vs 180°). */
 const HUE_MISMATCH_MAX_DEG = 40;
 
+/** Scale Oklab a/b into ~[−1, 1] for the NN (typical sRGB a,b magnitude ≈ 0.22). */
+const NN_OKLAB_AB_SCALE = 0.32;
+
+/** After Oklab jitter + sRGB clip, require HSL lightness in these bands so dark/light families stay separated. */
+const SYNTH_DARK_HSL_L_MAX = 44;
+const SYNTH_LIGHT_HSL_L_MIN = 62;
+
 interface TrainingSample {
   family: string;
   hsl: [number, number, number];
   themeName?: string;
+  /** Theme background hex when user-picked — matches `predictNeuralFamily` (hex-first Oklab). */
+  bgHex?: string;
+}
+
+interface OklabTrainingSample {
+  family: string;
+  lab: Oklab;
+  /** Extra gradient steps per epoch (custom rows train the net harder). */
+  trainReps?: number;
 }
 
 @Injectable({
@@ -89,7 +128,7 @@ export class MLService {
   private families: string[] = [];
   private isReady$ = new BehaviorSubject<boolean>(false);
   private storageKey = 'iterm2_ml_custom_anchors';
-  private weightsStorageKey = 'iterm2_ml_nn_weights_v1';
+  private weightsStorageKey = 'iterm2_ml_nn_weights_v2';
 
   // Semantic color mapping [H, S, L] — shared palette for ML on/off (navigator + theme accents)
   private semanticColors: Record<string, [number, number, number]> = {
@@ -150,7 +189,10 @@ export class MLService {
       .sort()
       .join('\n');
     const customSig = this.getCustomAnchors()
-      .map(a => `${a.themeName}\t${a.family}\t${a.hsl.join(',')}`)
+      .map(
+        a =>
+          `${a.themeName}\t${a.family}\t${a.hsl.join(',')}\t${a.bgHex ?? ''}`
+      )
       .sort()
       .join('\n');
     return `${baseSig}|${customSig}|${this.families.join('>')}`;
@@ -161,7 +203,15 @@ export class MLService {
     const raw = localStorage.getItem(this.weightsStorageKey);
     if (!raw) return;
     try {
-      const parsed = JSON.parse(raw) as { fingerprint: string; state: NeuralNetworkState };
+      const parsed = JSON.parse(raw) as {
+        fingerprint: string;
+        inputKind?: string;
+        state: NeuralNetworkState;
+      };
+      if (parsed.inputKind !== 'oklab') {
+        localStorage.removeItem(this.weightsStorageKey);
+        return;
+      }
       if (parsed.fingerprint !== this.computeTrainingFingerprint()) {
         localStorage.removeItem(this.weightsStorageKey);
         return;
@@ -186,6 +236,7 @@ export class MLService {
         this.weightsStorageKey,
         JSON.stringify({
           fingerprint: this.computeTrainingFingerprint(),
+          inputKind: 'oklab',
           state: this.nn.getState(),
         })
       );
@@ -194,8 +245,11 @@ export class MLService {
     }
   }
 
-  public async loadAndTrain(onEpoch?: (epoch: number, total: number) => void): Promise<void> {
-    if (this.isTraining) return;
+  public async loadAndTrain(
+    onEpoch?: (epoch: number, total: number) => void
+  ): Promise<MlTrainingRunStats | null> {
+    if (this.isTraining) return null;
+    const t0 = typeof performance !== 'undefined' ? performance.now() : 0;
     this.isTraining = true;
     try {
       // Refresh anchors in case of custom changes
@@ -204,32 +258,38 @@ export class MLService {
       this.families = Array.from(new Set(allAnchors.map(s => s.family)));
       this.anchorsRevision.update(n => n + 1);
 
-      // Generate synthetic training data around anchors
-    const trainingData: TrainingSample[] = [];
+      // Synthetic Oklab clouds: base rows stay on file centroids only; custom rows are a tight cloud around that theme (no shifting base clouds — avoids sucking in unrelated themes).
+    const trainingData: OklabTrainingSample[] = [];
     for (const anchor of allAnchors) {
       const userPicked = !!anchor.themeName;
-      // Base file: one canonical HSL per family. User override: one real theme should pull in every nearby HSL.
-      const sampleCount = userPicked ? 700 : 240;
+      const sampleCount = userPicked ? 320 : 240;
       trainingData.push(
-        ...this.generateSyntheticSamples(anchor, sampleCount, { userPickedTheme: userPicked })
+        ...this.generateSyntheticOklabSamples(anchor, sampleCount, {
+          userPickedTheme: userPicked,
+        })
       );
     }
 
-    // 3 inputs (H, S, L), 12 hidden neurons, families.length outputs
+    // 3 inputs (Oklab L, a, b — normalized), 12 hidden, one logit per family
     const newNn = new NeuralNetwork(3, 12, this.families.length);
 
     console.info('[ML] training started', {
       epochs: ML_TRAINING_EPOCHS,
       families: this.families.length,
       trainingSamples: trainingData.length,
+      customAnchorFamilies: new Set(customAnchors.map(c => c.family)).size,
       uiEvery: ML_TRAINING_UI_EVERY,
+      inputSpace: 'oklab',
     });
 
     for (let epoch = 0; epoch < ML_TRAINING_EPOCHS; epoch++) {
       for (const sample of trainingData) {
-        const inputs = this.normalizeHSL(sample.hsl);
+        const inputs = this.normalizeOklabForNn(sample.lab);
         const targets = this.families.map(f => (f === sample.family ? 1 : 0));
-        newNn.train(inputs, targets);
+        const reps = sample.trainReps ?? 1;
+        for (let r = 0; r < reps; r++) {
+          newNn.train(inputs, targets);
+        }
       }
       const current = epoch + 1;
       const showProgress =
@@ -244,6 +304,32 @@ export class MLService {
       }
     }
 
+    const trainingRowsByFamily: Record<string, number> = {};
+    const gradientStepsByFamily: Record<string, number> = {};
+    let totalGradientSteps = 0;
+    for (const s of trainingData) {
+      trainingRowsByFamily[s.family] = (trainingRowsByFamily[s.family] ?? 0) + 1;
+      const reps = s.trainReps ?? 1;
+      gradientStepsByFamily[s.family] = (gradientStepsByFamily[s.family] ?? 0) + reps;
+      totalGradientSteps += reps;
+    }
+    const stats: MlTrainingRunStats = {
+      finishedAt: new Date().toISOString(),
+      durationMs:
+        typeof performance !== 'undefined' ? Math.round(performance.now() - t0) : 0,
+      epochs: ML_TRAINING_EPOCHS,
+      classCount: this.families.length,
+      classOrder: [...this.families],
+      trainingRowsByFamily,
+      gradientStepsByFamily,
+      totalTrainingRows: trainingData.length,
+      totalGradientSteps,
+      customAnchorCount: customAnchors.length,
+      familiesWithCustomAnchors: [
+        ...new Set(customAnchors.map(c => c.family)),
+      ].sort(),
+    };
+
     this.nn = newNn;
     this.saveWeightsToStorage();
     this.isReady$.next(true);
@@ -251,7 +337,9 @@ export class MLService {
     console.info('[ML] training complete', {
       families: this.families.length,
       epochs: ML_TRAINING_EPOCHS,
+      report: stats,
     });
+    return stats;
     } finally {
       this.isTraining = false;
       this.trainingEpoch.set(null);
@@ -268,7 +356,51 @@ export class MLService {
   }
 
   public predict(h: number, s: number, l: number): string {
-    return this.classify(h, s, l);
+    if (!this.nn) return this.classify(h, s, l);
+    return this.familyFromNnOutputs(this.nn.predict(this.normalizeOklabForNn(hslToOklab(h, s, l))));
+  }
+
+  /**
+   * Argmax over trained outputs; null if no weights loaded. Uses Oklab from hex when available.
+   * Reconciles with the same physics as `classifyFromLab`: neutrals require low chroma + low RGB spread;
+   * dark themes cannot stay on light-only families (and vice versa). Without this, a small net can
+   * map saturated blues (e.g. Borland `#0000a4`) to Light Neutral even though ΔE to light anchors is huge.
+   */
+  public predictNeuralFamily(
+    hex: string,
+    h: number,
+    s: number,
+    l: number,
+    isDark?: boolean
+  ): string | null {
+    if (!this.nn) return null;
+    const lab = hexToOklab(hex) ?? hslToOklab(h, s, l);
+    const spread = rgbChannelSpreadFromHex(hex) ?? rgbChannelSpreadFromHsl(h, s, l);
+    const dark = isDark ?? l < 50;
+    const raw = this.familyFromNnOutputs(this.nn.predict(this.normalizeOklabForNn(lab)));
+    return this.reconcileNeuralPickWithRules(raw, lab, h, dark, spread);
+  }
+
+  /** Apply rule-based sanity checks to an NN label so training noise cannot violate color physics. */
+  private reconcileNeuralPickWithRules(
+    nnPick: string,
+    lab: Oklab,
+    hue: number,
+    isDark: boolean,
+    rgbSpread: number
+  ): string {
+    const chroma = oklabChroma(lab);
+    const achromatic = chroma < CHROMA_ACHROMATIC && rgbSpread <= RGB_SPREAD_NEUTRAL;
+    if ((nnPick === 'Dark Neutral' || nnPick === 'Light Neutral') && !achromatic) {
+      return this.classifyFromLab(lab, hue, isDark, rgbSpread);
+    }
+    if (isDark && this.isLightFamilyLabel(nnPick)) {
+      return this.nearestFamilyByHue(hue, true);
+    }
+    if (!isDark && this.isDarkFamilyLabel(nnPick)) {
+      return this.nearestFamilyByHue(hue, false);
+    }
+    return nnPick;
   }
 
   /**
@@ -352,39 +484,103 @@ export class MLService {
     return best.family;
   }
 
-  private generateSyntheticSamples(
+  /** Oklab of the canonical swatch in `color-training.txt` for this family, if known. */
+  private canonicalOklabForFamily(family: string): Oklab | null {
+    const sem = this.familyToSemantic[family];
+    if (!sem) return null;
+    const hsl = this.semanticColors[sem];
+    if (!hsl) return null;
+    return hslToOklab(hsl[0], hsl[1], hsl[2]);
+  }
+
+  private lerpOklab(a: Oklab, b: Oklab, t: number): Oklab {
+    return [
+      a[0] + (b[0] - a[0]) * t,
+      a[1] + (b[1] - a[1]) * t,
+      a[2] + (b[2] - a[2]) * t,
+    ];
+  }
+
+  /**
+   * Light vs dark lane for synthetic HSL gates must follow the **label** (semantic family), not
+   * `anchor.hsl` lightness. Otherwise a vivid dark-theme red (e.g. Hot Dog Stand L≈53) trains
+   * “Dark Red” only on pale reds (L≥62) and never pulls in true dark reds like Red Alert.
+   */
+  private synthHslLightnessGate(anchor: TrainingSample, hslL: number): boolean {
+    const ord = paletteOrderIndex(anchor.family);
+    if (ord >= 8) return hslL >= SYNTH_LIGHT_HSL_L_MIN;
+    if (ord <= 7) return hslL <= SYNTH_DARK_HSL_L_MAX;
+    return anchor.hsl[2] > 50
+      ? hslL >= SYNTH_LIGHT_HSL_L_MIN
+      : hslL <= SYNTH_DARK_HSL_L_MAX;
+  }
+
+  /** Oklab for an anchor; custom rows prefer bg hex so training matches NN inference. */
+  private anchorToOklab(anchor: TrainingSample): Oklab {
+    const [h, sl, ll] = anchor.hsl;
+    if (anchor.bgHex) {
+      const fromHex = hexToOklab(anchor.bgHex);
+      if (fromHex) return fromHex;
+    }
+    return hslToOklab(h, sl, ll);
+  }
+
+  private generateSyntheticOklabSamples(
     anchor: TrainingSample,
     count: number,
     opts: { userPickedTheme: boolean }
-  ): TrainingSample[] {
-    const samples: TrainingSample[] = [anchor];
+  ): OklabTrainingSample[] {
     const [h, s, l] = anchor.hsl;
-    const isLightClass = l > 50;
+    const anchorLab = this.anchorToOklab(anchor);
     const u = opts.userPickedTheme;
-    /** Base anchors: tight jitter so global families do not bleed. User-picked: wide cloud around that theme’s HSL so one label covers neighbors. */
-    const hueJitter = u ? 28 : 14;
-    const satSpan = u ? 44 : 30;
-    const satHalf = satSpan / 2;
-
-    for (let i = 0; i < count - 1; i++) {
-      const newH = (h + (Math.random() * (2 * hueJitter) - hueJitter) + 360) % 360;
-      const newS = Math.max(0, Math.min(100, s + (Math.random() * satSpan - satHalf)));
-
-      let newL: number;
-      if (isLightClass) {
-        const lSpan = u ? 38 : 30;
-        newL = Math.max(70, Math.min(100, l + (Math.random() * lSpan - lSpan / 2)));
-      } else {
-        const lSpan = u ? 26 : 20;
-        newL = Math.max(0, Math.min(35, l + (Math.random() * lSpan - lSpan / 2)));
-      }
-
-      samples.push({
-        family: anchor.family,
-        hsl: [newH, newS, newL]
-      });
+    const samples: OklabTrainingSample[] = [{ family: anchor.family, lab: anchorLab }];
+    const centroid = this.canonicalOklabForFamily(anchor.family);
+    let jitterOrigin = anchorLab;
+    /** Dark: small blend toward file centroid (helps maroons vs bright reds). Light: stay on the anchored theme only — blending toward e.g. light gray balloons the class. */
+    if (u && centroid && this.isDarkFamilyLabel(anchor.family)) {
+      jitterOrigin = this.lerpOklab(anchorLab, centroid, 0.42);
+    }
+    /** Tight cloud for user anchors so one correction does not relabel the whole gallery. */
+    const dL = u ? 0.045 : 0.052;
+    const chromaR = u ? 0.048 : 0.056;
+    const maxAttempts = (count - 1) * 14;
+    let accepted = 0;
+    for (let attempt = 0; attempt < maxAttempts && accepted < count - 1; attempt++) {
+      const dl = (Math.random() * 2 - 1) * dL;
+      const ang = Math.random() * Math.PI * 2;
+      const cr = Math.random() * chromaR;
+      const da = Math.cos(ang) * cr;
+      const db = Math.sin(ang) * cr;
+      const raw: Oklab = [jitterOrigin[0] + dl, jitterOrigin[1] + da, jitterOrigin[2] + db];
+      const lab = clampOklabToSrgbGamut(raw);
+      if (!lab) continue;
+      const [r01, g01, b01] = oklabToLinearSrgb01(lab);
+      if (![r01, g01, b01].every(Number.isFinite)) continue;
+      const [, , hslL] = linearSrgb01ToHsl(r01, g01, b01);
+      if (!this.synthHslLightnessGate(anchor, hslL)) continue;
+      samples.push({ family: anchor.family, lab });
+      accepted++;
+    }
+    while (samples.length < count) {
+      samples.push({ family: anchor.family, lab: anchorLab });
     }
     return samples;
+  }
+
+  private normalizeOklabForNn(lab: Oklab): number[] {
+    return [
+      Math.min(1, Math.max(0, lab[0])),
+      Math.max(-1.25, Math.min(1.25, lab[1] / NN_OKLAB_AB_SCALE)),
+      Math.max(-1.25, Math.min(1.25, lab[2] / NN_OKLAB_AB_SCALE)),
+    ];
+  }
+
+  private familyFromNnOutputs(outputs: number[]): string {
+    let best = 0;
+    for (let i = 1; i < outputs.length; i++) {
+      if (outputs[i] > outputs[best]) best = i;
+    }
+    return this.families[best] ?? 'Unknown';
   }
 
   private parseTrainingData(text: string): TrainingSample[] {
@@ -414,19 +610,14 @@ export class MLService {
     return anchors;
   }
 
-  private normalizeHSL(hsl: [number, number, number]): number[] {
-    return [hsl[0] / 360, hsl[1] / 100, hsl[2] / 100];
-  }
-
-  /** Smallest ΔE in Oklab to base + custom anchor HSLs (anchors converted to Oklab the same way). */
+  /** Smallest ΔE in Oklab to base + custom anchors (hex-first for customs, same as training / predict). */
   private nearestFamilyOklab(lab: Oklab): string {
     if (this.baseAnchors.length === 0) return 'Unknown';
     const candidates: TrainingSample[] = [...this.baseAnchors, ...this.getCustomAnchors()];
     let bestFamily = candidates[0].family;
     let bestD = Infinity;
     for (const a of candidates) {
-      const [ah, as, al] = a.hsl;
-      const alab = hslToOklab(ah, as, al);
+      const alab = this.anchorToOklab(a);
       const d = oklabDeltaE(lab, alab);
       if (d < bestD) {
         bestD = d;
@@ -444,25 +635,33 @@ export class MLService {
   }
 
   public getFamilyMetadata() {
-    return this.families.map(name => {
-      const hsl = this.semanticColors[this.familyToSemantic[name]] || [0, 0, 50];
-      return {
-        name,
-        semanticVar: semanticVarForFamily(name),
-        isDark: hsl[2] < 50
-      };
-    });
+    return [...this.families]
+      .sort((a, b) => paletteOrderIndex(a) - paletteOrderIndex(b))
+      .map(name => {
+        const hsl = this.semanticColors[this.familyToSemantic[name]] || [0, 0, 50];
+        return {
+          name,
+          semanticVar: semanticVarForFamily(name),
+          isDark: hsl[2] < 50
+        };
+      });
   }
 
   // Custom User Anchors Persistence
-  public addCustomAnchor(themeName: string, family: string, hsl: [number, number, number]) {
+  public addCustomAnchor(
+    themeName: string,
+    family: string,
+    hsl: [number, number, number],
+    bgHex: string
+  ) {
     if (typeof window === 'undefined') return;
     const anchors = this.getCustomAnchors();
+    const row: TrainingSample = { themeName, family, hsl, bgHex };
     const existingIdx = anchors.findIndex(a => a.themeName === themeName);
     if (existingIdx !== -1) {
-      anchors[existingIdx] = { themeName, family, hsl };
+      anchors[existingIdx] = row;
     } else {
-      anchors.push({ themeName, family, hsl });
+      anchors.push(row);
     }
     localStorage.setItem(this.storageKey, JSON.stringify(anchors));
     localStorage.removeItem(this.weightsStorageKey);

@@ -6,6 +6,7 @@
     "ng": "ng",
     "start": "ng serve",
     "classify-themes": "node scripts/apply-oklab-families.mjs",
+    "render:diagram": "mmdc -i doc/mermaid/nn-classifier-flow.mmd -o doc/assets/nn-classifier-flow.svg -b white -w 880 && node scripts/flatten-mermaid-svg.mjs doc/assets/nn-classifier-flow.svg",
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
     "serve:ssr:iterm-gallery": "node dist/iterm-gallery/server/server.mjs"
@@ -35,6 +36,7 @@
     "@angular/compiler-cli": "^21.2.0",
     "@types/express": "^5.0.1",
     "@types/node": "^20.17.19",
+    "@mermaid-js/mermaid-cli": "^11.12.0",
     "prettier": "^3.8.1",
     "typescript": "~5.9.2"
   }

@@ -49,6 +49,54 @@ export function hexToOklab(hex: string): Oklab | null {
   );
 }
 
+/** Oklab → linear sRGB channels in [0, 1] (may exceed range before clipping). */
+export function oklabToLinearSrgb01(lab: Oklab): [number, number, number] {
+  const L = lab[0];
+  const a = lab[1];
+  const b = lab[2];
+  const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+  const m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+  const s_ = L - 0.0894841775 * a - 1.291485548 * b;
+  const l = l_ * l_ * l_;
+  const m = m_ * m_ * m_;
+  const s = s_ * s_ * s_;
+  return [
+    +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s,
+  ];
+}
+
+/** Project arbitrary Oklab onto the sRGB cube; null if non-finite. */
+export function clampOklabToSrgbGamut(lab: Oklab): Oklab | null {
+  const [r, g, b] = oklabToLinearSrgb01(lab);
+  if (![r, g, b].every(Number.isFinite)) return null;
+  const rc = Math.min(1, Math.max(0, r));
+  const gc = Math.min(1, Math.max(0, g));
+  const bc = Math.min(1, Math.max(0, b));
+  return linearSrgbToOklab(rc, gc, bc);
+}
+
+/** Linear RGB 0–1 → HSL (deg, 0–100, 0–100); used to keep synthetic samples in dark/light lanes. */
+export function linearSrgb01ToHsl(r: number, g: number, b: number): [number, number, number] {
+  const R = Math.min(1, Math.max(0, linearChannelToSrgb(r)));
+  const G = Math.min(1, Math.max(0, linearChannelToSrgb(g)));
+  const B = Math.min(1, Math.max(0, linearChannelToSrgb(b)));
+  const max = Math.max(R, G, B);
+  const min = Math.min(R, G, B);
+  const d = max - min;
+  const lum = ((max + min) / 2) * 100;
+  let hue = 0;
+  let sat = 0;
+  if (d > 1e-10) {
+    sat = (lum > 50 ? d / (2 - max - min) : d / (max + min)) * 100;
+    if (max === R) hue = ((G - B) / d + (G < B ? 6 : 0)) * 60;
+    else if (max === G) hue = ((B - R) / d + 2) * 60;
+    else hue = ((R - G) / d + 4) * 60;
+  }
+  return [(hue + 360) % 360, sat, lum];
+}
+
 function parseHexRgb(hex: string): [number, number, number] | null {
   const m = hex.trim().match(/^#?([0-9a-f]{3}|[0-9a-f]{6})$/i);
   if (!m) return null;
@@ -94,6 +142,10 @@ function hslToSrgb01(h: number, s: number, l: number): [number, number, number] 
 
 function srgbToLinear(c: number): number {
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function linearChannelToSrgb(c: number): number {
+  return c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
 }
 
 function linearSrgbToOklab(r: number, g: number, b: number): Oklab {
